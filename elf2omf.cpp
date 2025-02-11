@@ -79,8 +79,7 @@ struct reloc {
 
 	unsigned symbol = 0;
 
-	unsigned size = 0;
-	unsigned shift = 0;
+	unsigned type = 0;
 	unsigned addend = 0;
 };
 
@@ -139,7 +138,7 @@ symbol &find_symbol(const std::string &name) {
 		global_symbol_map.emplace(name, s.id);
 		return s;
 	} else {
-		return global_symbols[iter->second];
+		return global_symbols[iter->second - 1];
 	}
 }
 
@@ -156,7 +155,7 @@ section &find_section(const std::string &name) {
 		global_section_map.emplace(name, s.id);
 		return s;
 	} else {
-		return global_sections[iter->second];
+		return global_sections[iter->second - 1];
 	}
 }
 
@@ -172,7 +171,7 @@ int load_elf_header(int fd, Elf32_Ehdr &header) {
 	if (ok < 0) throw_errno("read");
 	if (ok != sizeof(header)) throw_elf_error();
 
-	if (!memcmp(header.e_ident, ELFMAG, SELFMAG)) throw_elf_error();
+	if (memcmp(header.e_ident, ELFMAG, SELFMAG)) throw_elf_error();
 
 	if (must_swap(header)) bswap(header);
 
@@ -198,7 +197,7 @@ int load_elf_sections(int fd, const Elf32_Ehdr &header, std::vector<Elf32_Shdr> 
 	return 0;
 }
 
-int load_elf_data(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, std::vector<uint8_t> rv) {
+int load_elf_data(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, std::vector<uint8_t> &rv) {
 
 	if (lseek(fd, section.sh_offset, SEEK_SET) < 0)
 		throw_errno("lseek");
@@ -215,7 +214,7 @@ int load_elf_data(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, s
 
 }
 
-int load_elf_string_table(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, std::vector<uint8_t> rv) {
+int load_elf_string_table(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, std::vector<uint8_t> &rv) {
 
 	rv.resize(0);
 	int ok = load_elf_data(fd, header, section, rv);
@@ -225,7 +224,7 @@ int load_elf_string_table(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& se
 
 
 template<class T>
-int load_elf_type(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, std::vector<T> rv) {
+int load_elf_type(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, std::vector<T> &rv) {
 
 	rv.resize(0);
 	if (section.sh_size == 0) return 0;
@@ -256,6 +255,50 @@ bool is_dp(const std::string &name) {
 	if (c == 'z' && name == "ztiny") return true;
 	if (c == 't' && name == "tiny") return true;
 	return false;
+}
+
+
+static unsigned type_to_size[16] = { 0, 1, 2, 3, 4, 8, 0, 0, 1, 2, 2, 1, 2, 3, 2, 2 };
+static unsigned type_to_shift[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 16, 0, 16 };
+
+/* do an absolute relocation. */
+int abs_reloc(section &section, uint32_t offset, uint32_t value, unsigned type) {
+
+	if (type > 15) return -1;
+	unsigned size = type_to_size[type];
+	unsigned shift = type_to_shift[type];
+
+	if (offset >= section.data.size()) return -1;
+	if (offset + size > section.data.size()) return -1;
+
+	switch (type) {
+	case 0:
+	case 6:
+	case 7:
+		/* unknown type */
+		return -1;
+	case 1: /* dp */
+	case 8:
+		if (value > 0xff) warn(".tiny absolute relocation overflow");
+		break;
+	case 2: /* abs */
+	case 9:
+		if (value > 0xffff) warn(".near absolute relocation overflow");
+		break;
+	case 3: /* long */
+		if (value > 0xffffff) warn(".far absolute relocation overflow");
+		break;
+	case 10: /* .kbank */
+		if (value > 0xffff) warn(".kbank absolute relocation overflow");
+		break;
+	}
+
+	if (shift) value <<= shift;
+	for (unsigned i = 0; i < size; ++i, ++offset, value >>= 8) {
+		section.data[offset] = value & 0xff;
+	}
+
+	return 0;
 }
 
 int one_file(const std::string &filename) {
@@ -295,8 +338,8 @@ int one_file(const std::string &filename) {
 		if (header.e_ident[EI_VERSION] != EV_CURRENT) ok = false;
 		if (header.e_type != ET_REL) ok = false;
 		if (header.e_machine != EM_65816) ok = false;
-		if (header.e_version != 1) ok = false;
-		if (header.e_shentsize != 0x28) ok = false;
+		if (header.e_version != EV_CURRENT) ok = false;
+		if (header.e_shentsize != sizeof(Elf32_Shdr)) ok = false;
 		if (header.e_shnum == 0) ok = false;
 
 		if (!ok) {
@@ -397,28 +440,17 @@ int one_file(const std::string &filename) {
 					reloc rr;
 
 					rr.dest_segment = local_section_map[s.sh_link].section;
-					rr.dest_offset = local_section_map[s.sh_link].offset;
+					rr.dest_offset = local_section_map[s.sh_link].offset + r.r_offset;
 
-					// todo -- split up later so we can check for .tiny, .kbank, etc errors?
-					static unsigned kSize[16] = { 0, 1, 2, 3, 4, 8, 0, 0, 1, 2, 2, 1, 2, 3, 2, 2 };
-					static unsigned kShift[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 16, 0, 16 };
-					rr.size = kSize[rtype];
-					rr.shift = kShift[rtype];
+					rr.type = rtype;
 					rr.addend = r.r_addend;
 
 					// todo -- verify address is valid?
 
 					if (sym.st_shndx == SHN_ABS) {
 						// this is a constant number (should never happen) so relocate now....
-						uint32_t value = sym.st_value;
-						uint32_t address = rr.dest_offset;
-						if (rr.shift) value >>= rr.shift;
-						unsigned size = rr.size;
-						while (size) {
-							gs.data[offset++] = value & 0xff;
-							value >>= 8;
-							--size;
-						}
+
+						abs_reloc(gs, rr.dest_offset, sym.st_value, rtype);
 						continue;
 					}
 
@@ -574,10 +606,19 @@ int main(int argc, char **argv) {
 
 	if (flags.o.empty()) flags.o = "out.omf";
 
-	for (int i = 0; i < argc; ++argv) {
-		if (!one_file(argv[i])) ++flags.errors;
+	for (int i = 0; i < argc; ++i) {
+		std::string name = argv[i];
+		if (one_file(name) < 0) ++flags.errors;
 	}
 
+	// if there are any missing symbols, search library files...
+
+	// merge sections into omf segments...
+	// (and build the stack segment...)
+	// do any absolute relocations....
+	// convert relocations to omf relocations
+	// save the omf file.
+	// done!
 
 
 	exit(0);

@@ -1,5 +1,5 @@
-CXX = /usr/local/Cellar/llvm/17.0.6_1/bin/clang++
-CXXFLAGS = -std=c++20
+#CXX = /usr/local/Cellar/llvm/17.0.6_1/bin/clang++
+CXXFLAGS = -std=c++17 -g
 # CC = $(CXX)
 
 .PHONY: all
