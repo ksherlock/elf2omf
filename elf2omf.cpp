@@ -72,25 +72,39 @@ struct {
 
 
 struct reloc {
-	unsigned src_segment = 0;
+	unsigned offset = 0;
+	unsigned value = 0;
+
+	// negative indicates this is a section.
+	int symbol = 0;
+	unsigned type = 0;
+
+/*
+	unsigned src_section = 0;
 	unsigned src_offset = 0;
-	unsigned dest_segment = 0;
+	unsigned dest_section = 0;
 	unsigned dest_offset = 0;
 
 	unsigned symbol = 0;
 
 	unsigned type = 0;
 	unsigned addend = 0;
+*/
 };
+
+
 
 struct symbol {
 	std::string name;
 	int id = 0;
 
-	uint8_t type = 0;
-	uint8_t flags = 0;
+	// uint8_t type = 0;
+	// uint8_t flags = 0;
 	uint32_t offset = 0;
 	int section = 0;
+	unsigned count = 0; // number of references
+	bool local = false;
+	bool absolute = false;
 };
 
 
@@ -99,10 +113,11 @@ struct section {
 	std::string name;
 	int id = 0;
 
-	uint8_t flags = 0;
+	// uint8_t flags = 0;
 	uint32_t size = 0;
 	uint32_t align = 0;
 
+	// flag for bss-only?
 	std::vector<uint8_t> data;
 	std::vector<reloc> relocs;
 };
@@ -125,38 +140,78 @@ void throw_elf_error() {
 	throw std::runtime_error("invalid elf file");
 }
 
+bool is_dp(const std::string &name) {
+	if (name.empty()) return false;
+	char c = name.front();
+	if (c == 'r' && name == "registers") return true;
+	if (c == 'z' && name == "ztiny") return true;
+	if (c == 't' && name == "tiny") return true;
+	return false;
+}
 
 /* find or create a symbol */
 symbol &find_symbol(const std::string &name) {
 	auto iter = global_symbol_map.find(name);
 	if (iter == global_symbol_map.end()) {
-		global_symbols.push_back({});
-		auto &s = global_symbols.back();
-		s.name = name;
-		s.id = global_symbols.size();
+		auto &sym = global_symbols.emplace_back();
+		sym.name = name;
+		sym.id = global_symbols.size();
 
-		global_symbol_map.emplace(name, s.id);
-		return s;
-	} else {
-		return global_symbols[iter->second - 1];
+		global_symbol_map.emplace(name, sym.id);
+		return sym;
 	}
+	return global_symbols[iter->second - 1];
 }
+
+symbol &find_symbol(const std::string &name, bool anonymous) {
+
+	auto iter = global_symbol_map.find(name);
+	if (iter == global_symbol_map.end()) {
+		auto &sym = global_symbols.emplace_back();
+		sym.name = name;
+		sym.id = global_symbols.size();
+
+		if (!anonymous) global_symbol_map.emplace(name, sym.id);
+		return sym;
+	}
+	return global_symbols[iter->second - 1];
+
+}
+
+// lookup/create a symbol table first in the local table, then in the global table.
+symbol &find_symbol(const std::string &name, std::unordered_map<std::string, int> &local_symbol_map, bool create_locally = false) {
+
+	auto iter = local_symbol_map.find(name);
+	if (iter == local_symbol_map.end()) {
+		if (!create_locally) return find_symbol(name);
+		auto &sym = global_symbols.emplace_back();
+		sym.name = name;
+		sym.id = global_symbols.size();
+		local_symbol_map.emplace(name, sym.id);
+		return sym;
+	}
+
+	return global_symbols[iter->second - 1];
+}
+
+
 
 /* find or create a section */
 section &find_section(const std::string &name) {
 
+	/* special case for known dp segments! */
+	if (is_dp(name)) return global_sections[0];
+
 	auto iter = global_section_map.find(name);
 	if (iter == global_section_map.end()) {
-		global_sections.push_back({});
-		auto &s = global_sections.back();
+		auto &s = global_sections.emplace_back();
 		s.name = name;
 		s.id = global_sections.size();
 
 		global_section_map.emplace(name, s.id);
 		return s;
-	} else {
-		return global_sections[iter->second - 1];
 	}
+	return global_sections[iter->second - 1];
 }
 
 bool must_swap(const Elf32_Ehdr &header) {
@@ -248,14 +303,7 @@ int load_elf_type(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, s
 }
 
 
-bool is_dp(const std::string &name) {
-	if (name.empty()) return false;
-	char c = name.front();
-	if (c == 'r' && name == "registers") return true;
-	if (c == 'z' && name == "ztiny") return true;
-	if (c == 't' && name == "tiny") return true;
-	return false;
-}
+
 
 
 static unsigned type_to_size[16] = { 0, 1, 2, 3, 4, 8, 0, 0, 1, 2, 2, 1, 2, 3, 2, 2 };
@@ -301,6 +349,134 @@ int abs_reloc(section &section, uint32_t offset, uint32_t value, unsigned type) 
 	return 0;
 }
 
+#if 0
+
+// check if a dp section is trivial
+// ie - all data is 0, no relocations.
+// this should be done after simplify_dp_relocs.
+bool trivial_dp_section(const section &dp) {
+
+	if (std::any_of(dp.data.begin(), dp.data.end(), [](uint8_t x){ (bool)x; })) return false;
+	if (!dp.relocs.empty()) return false;
+
+	// now check all others...
+	for (const auto &s : global_sections) {
+		for (const auto &r : s.relocs) {
+			if (r.src_section == dp.id) return false;
+		}
+	}
+	return true;
+}
+
+// convert trivial dp relocations into constants
+// eg sta dp:var -> sta $05
+void simplify_dp_relocs(int dp_id) {
+	// .tiny/dp relocations can be converted to constant access.
+	for (auto &s : global_sections) {
+
+		auto it = std::remove_if(s.relocs.begin(), s.relocs.end(), [&](const auto &r){
+
+			if (r.src_section != dp_id) return false;
+			if (r.type != 1 && r.type != 8 && r.type != 11) return false;
+			const auto &sym = global_symbols[r.symbol - 1];
+
+			abs_reloc(s, r.dest_offset, sym.offset + r.src_offset + r.addend, r.type);
+			return true;
+		});
+		s.relocs.erase(it, s.end());
+	}
+}
+
+void simplify_abs_relocs() {
+
+	// SHN_ABS symbols can be removed
+	for (auto &s : global_sections) {
+
+		auto it = std::remove_if(s.relocs.begin(), s.relocs.end(), [&](const auto &r){
+
+			const auto &sym = global_symbols[r.symbol - 1];
+			if (sym.section == -1) {
+				abs_reloc(s, r.dest_offset, sym.offset, r.type);
+				return true;
+			}
+			return false;
+		});
+		s.relocs.erase(it, s.end());
+	}
+}
+#endif
+
+// dp symbol simplification must be done *after* merge so offsets are correct.
+void simplify_relocations() {
+	// 1. reify SHN_ABS
+	// 2. reify dp references, if possible.
+	// n.b. - section #1 is the merged dp/stack section.
+
+	for (auto &s : global_sections) {
+
+		auto it = std::remove_if(s.relocs.begin(), s.relocs.end(), [&](const auto &r){
+
+			const auto &sym = global_symbols[r.symbol - 1];
+			if (sym.section == -1) {
+				// absolute
+				abs_reloc(s, r.offset, sym.offset, r.type);
+				return true;
+			}
+
+			if (sym.section == 1) {
+				if (r.type == 1 || r.type == 8 || r.type == 11) {
+					abs_reloc(s, r.offset, r.value + sym.offset, r.type);
+					return true;
+				}
+			}
+			return false;
+		});
+		s.relocs.erase(it, s.relocs.end());
+	}
+}
+
+#if 0
+void to_omf(void) {
+
+
+	std::vector<omf::segment> segments;
+	omf::segment dp_segment;
+
+
+	// map the old section to the new segment.
+	struct map {
+		unsigned section = 0;
+		unsigned offset = 0;
+		unsigned align;
+	};
+
+
+	std::vector<map> local_section_map(global_sections.size());
+
+	for (auto &s : global_sections) {
+		if (is_dp(s.name)) {
+
+			auto &m = local_section_map[s.id];
+			m.section = -1;
+			m.offset = dp_segment.size();
+			m.align = std::max(m.align, s.align);
+
+			auto &data = dp_segment.data();
+			if (data.empty()) {
+				data = std::move(s.data);
+			} else {
+
+			}
+			continue;
+		}
+	}
+
+
+
+}
+#endif
+
+
 int one_file(const std::string &filename) {
 	// process one elf file.
 
@@ -323,6 +499,7 @@ int one_file(const std::string &filename) {
 
 	std::vector<section_map> local_section_map;
 
+	if (flags.v) printf("%s...\n", filename.c_str());
 	fd = open(filename.c_str(), O_RDONLY);
 	if (fd < 0) {
 		warn("open %s", filename.c_str());
@@ -356,10 +533,22 @@ int one_file(const std::string &filename) {
 		local_section_map.resize(header.e_shnum + 1);
 
 		// pass 1 - process SHT_PROGBITS and SHT_NOBITS
+		// also load the symbol table.
+		// i suppose there could be > 1 symbol table but only one supported for now.
+		int current_st = -1;
+		std::vector<Elf32_Sym> st;
+
 		int sh_num = -1;
 		for (const auto &s : sections) {
 
 			++sh_num;
+			if (s.sh_type == SHT_SYMTAB) {
+				if (current_st != -1) throw_elf_error("multiple symbol tables");
+				current_st = sh_num;
+				load_elf_type<Elf32_Sym>(fd, header, s, st);
+				continue;
+			}
+
 			if (s.sh_type != SHT_PROGBITS && s.sh_type != SHT_NOBITS) continue;
 
 			// if (s.sh_name == 0) continue;
@@ -394,123 +583,171 @@ int one_file(const std::string &filename) {
 			}
 		}
 
-		// pass 2 - process relocation records and symbol table records.
-		// i suppose there could be multiple symbol table sections but there's most likely just one...
 
-		int current_st = -1;
-		sh_num = -1;
-		std::vector<Elf32_Sym> st;
 
-		for (const auto &s : sections) {
-			++sh_num;
-			if (s.sh_type == SHT_REL || s.sh_type == SHT_RELA) {
+		// pass 1.5 -- load the symbol tables.
+		// local symbols go into the global symbol table but not the global symbol table map.
+		std::unordered_map<std::string, int> local_symbol_map;
 
-				if (current_st != s.sh_link) {
-					if (s.sh_link == 0 || s.sh_link >= sections.size()) throw_elf_error("bad sh_link");
-					load_elf_type<Elf32_Sym>(fd, header, sections[s.sh_link], st);
-					current_st = s.sh_link;
-				}
+		std::vector<int> symbol_to_symbol;
+		symbol_to_symbol.reserve(st.size());
 
-				unsigned ix = local_section_map[s.sh_link].section;
-				unsigned offset = local_section_map[s.sh_link].offset;
-				auto &gs = global_sections[ix];
 
-				std::vector<Elf32_Rela> rels;
+		for (const auto &x : st) {
 
-				if (s.sh_type == SHT_REL) {
-					std::vector<Elf32_Rel> tmp;
-					load_elf_type<Elf32_Rel>(fd, header, s, tmp);
-					std::transform(tmp.begin(), tmp.end(), std::back_inserter(rels), [](const Elf32_Rel &r){
-						Elf32_Rela rr = { r.r_offset, r.r_info, 0 };
-						return rr;
-					});
-				} else {
-					load_elf_type<Elf32_Rela>(fd, header, s, rels);
-				}
+			// copy global/weak symbols to the global symbol table
+			// skip local symbols.
+			unsigned bind = ELF32_ST_BIND(x.st_info);
+			unsigned type = ELF32_ST_BIND(x.st_info);
 
-				for (const auto &r : rels) {
-					int rsym = ELF32_R_SYM(r.r_info);
-					int rtype = ELF32_R_TYPE(r.r_info);
 
-					const auto &sym = st[rsym];
-					// type -> size/shift info
-					unsigned bind = ELF32_ST_BIND(sym.st_info);
-					unsigned type = ELF32_R_TYPE(sym.st_info);
-
-					reloc rr;
-
-					rr.dest_segment = local_section_map[s.sh_link].section;
-					rr.dest_offset = local_section_map[s.sh_link].offset + r.r_offset;
-
-					rr.type = rtype;
-					rr.addend = r.r_addend;
-
-					// todo -- verify address is valid?
-
-					if (sym.st_shndx == SHN_ABS) {
-						// this is a constant number (should never happen) so relocate now....
-
-						abs_reloc(gs, rr.dest_offset, sym.st_value, rtype);
-						continue;
-					}
-
-					std::string name = (char *)string_table.data() + sym.st_name;
-
-					if (sym.st_shndx == SHN_UNDEF ) {
-						auto &gs = find_symbol(name); // possibly generate a new symbol table entry.
-						rr.symbol = gs.id;
-						rr.src_segment = 0; 
-						rr.src_offset = 0; 
-					} else {
-						// local symbol!
-						rr.src_segment = local_section_map[sym.st_shndx].offset;
-						rr.src_offset = local_section_map[sym.st_shndx].section;
-					}
-					gs.relocs.push_back(rr);
-				}
+			if (x.st_name == 0 || x.st_name >= string_table.size()) {
+				symbol_to_symbol.push_back(0);
 				continue;
 			}
-			if (s.sh_type == SHT_SYMTAB) {
+			std::string name = (char *)string_table.data() + x.st_name;
 
-				if (current_st != sh_num) {
-					load_elf_type<Elf32_Sym>(fd, header, s, st);
-					current_st = sh_num;
+
+			// todo -- the .calypsi_info section can make some undefined references
+			// a .require-ment.
+
+
+			// todo -- another function find_symbol(name, bool create_anonymously)?
+
+			symbol &sym = find_symbol(name, local_symbol_map, bind == STB_LOCAL);
+
+			symbol_to_symbol.push_back(sym.id);
+
+			bool required = false; // todo....
+			if (required) sym.count++;
+
+			if (x.st_shndx == 0) continue;
+
+
+			if (sym.section == 0) {
+				// new symbol!  let's define it
+				// todo -- SHN_COMMON?
+
+				if (bind == STB_LOCAL) sym.local = true;
+
+				if (x.st_shndx == SHN_COMMON) {
+					errx(1, "SHN_COMMON not yet supported.");
+				}
+				if (x.st_shndx == SHN_ABS) {
+					sym.absolute = true;
+					sym.offset = x.st_value;
+					sym.section = -1;
+				} else {
+					// SHN_UNDEF handled above.
+					sym.section = local_section_map[x.st_shndx].section;
+					sym.offset = x.st_value + local_section_map[x.st_shndx].offset;
 				}
 
-				for (const auto &x : st) {
-					// copy global/weak symbols to the global symbol table
-					// skip local symbols.
-					unsigned bind = ELF32_ST_BIND(x.st_info);
-					unsigned type = ELF32_ST_BIND(x.st_info);
+			 } else {
 
-					if (bind == STB_LOCAL) continue;
-					if (x.st_shndx == 0) continue; // undefined -- just a reference.
+				if (bind == STB_LOCAL) {
+					warnx("%s: duplicate symbol (%s)", filename.c_str(), name.c_str());
+					continue;
+				}
 
-					if (x.st_name == 0 || x.st_name >= string_table.size()) continue;
-					std::string name = (char *)string_table.data() + x.st_name;
-
-					symbol &gs = find_symbol(name);
-					if (x.st_shndx == 0) continue; // just a reference, so nothing to update.
-
-					if (gs.section == 0) {
-						// new symbol!  let's define it
-						if (x.st_shndx == SHN_ABS) {
-							gs.offset = x.st_value;
-							gs.section = -1;
-						} else {
-							gs.section = local_section_map[x.st_shndx].section;
-							gs.offset = x.st_value + local_section_map[x.st_shndx].offset;
-						}
-					 } else {
-					 	// known symbol.  weak is ok, otherwise, warn.
-						if (bind == STB_GLOBAL) {
-							// allow duplicate absolute symbols?
-							warnx("%s: duplicate symbol (%s)", filename.c_str(), name.c_str());
-							continue;
-						}
-					}
+			 	// known symbol.  weak is ok, otherwise, warn.
+				if (bind == STB_GLOBAL) {
+					// allow duplicate absolute symbols?
+					warnx("%s: duplicate symbol (%s)", filename.c_str(), name.c_str());
+					continue;
 				}
 			}
+		}
+
+		// build map of elf symbol table entries to global_symbol entries?
+
+
+		// pass 2 - process relocation records.
+
+
+		sh_num = -1;
+
+		// pass 2 - process the relocation records.
+		for (const auto &s : sections) {
+			++sh_num;
+			if (s.sh_type != SHT_REL && s.sh_type != SHT_RELA) continue;
+
+
+			// sh_link is the associated symbol table.
+			// sh_info is the associated data section 
+
+			if (current_st != s.sh_link) {
+				throw_elf_error("bad symbol table reference");
+			}
+
+			unsigned section_offset = local_section_map[s.sh_info].offset;
+			unsigned section_id = local_section_map[s.sh_info].section;
+
+			section &gs = global_sections[section_id - 1];
+
+			std::vector<Elf32_Rela> rels;
+
+			if (s.sh_type == SHT_REL) {
+				std::vector<Elf32_Rel> tmp;
+				load_elf_type<Elf32_Rel>(fd, header, s, tmp);
+				std::transform(tmp.begin(), tmp.end(), std::back_inserter(rels), [](const Elf32_Rel &r){
+					Elf32_Rela rr = { r.r_offset, r.r_info, 0 };
+					return rr;
+				});
+			} else {
+				load_elf_type<Elf32_Rela>(fd, header, s, rels);
+			}
+
+			for (const auto &r : rels) {
+				int rsym = ELF32_R_SYM(r.r_info);
+				int rtype = ELF32_R_TYPE(r.r_info);
+
+				if (rsym > symbol_to_symbol.size() || !symbol_to_symbol[rsym]) {
+					warnx("%s: bad relocation", filename.c_str());
+					continue;
+				}
+
+
+				// const auto &sym = st[rsym];
+
+				// unsigned bind = ELF32_ST_BIND(sym.st_info);
+				// unsigned type = ELF32_R_TYPE(sym.st_info);
+
+				auto &sym = global_symbols[symbol_to_symbol[rsym] - 1];
+				sym.count++;
+
+				reloc rr;
+
+				rr.offset = section_offset + r.r_offset;
+
+				rr.type = rtype;
+				rr.value = r.r_addend;
+				rr.symbol = sym.id;
+				gs.relocs.push_back(rr);
+
+#if 0
+				if (sym.st_shndx == SHN_ABS) {
+					// this is a constant number (should never happen) so relocate now....
+					abs_reloc(gs, rr.offset, sym.st_value, rtype);
+					continue;
+				}
+
+				std::string name = (char *)string_table.data() + sym.st_name;
+
+				// todo -- SHN_COMMON?
+
+				if (sym.st_shndx == SHN_UNDEF ) {
+					auto &gs = find_symbol(name); // possibly generate a new symbol table entry.
+					rr.symbol = gs.id;
+				} else {
+					// local symbol could be private so bypass symbol table stuff.
+					rr.symbol = -local_section_map[sym.st_shndx].section; 
+					rr.value += local_section_map[sym.st_shndx].offset + sym.st_value;
+				}
+				gs.relocs.push_back(rr);
+#endif
+			}
+
 		}
 	} catch(std::exception &ex) {
 		close(fd);
@@ -522,7 +759,14 @@ int one_file(const std::string &filename) {
 	return 0;
 }
 
+void init(void) {
 
+	// create dp/stack segment for 
+	// this does not go in the name map.
+	auto &s = global_sections.emplace_back();
+	s.name = "dp/stack";
+	s.id = 1;
+}
 
 bool parse_ft(const std::string &s) {
 
@@ -606,12 +850,35 @@ int main(int argc, char **argv) {
 
 	if (flags.o.empty()) flags.o = "out.omf";
 
+
+	init();
+
+
 	for (int i = 0; i < argc; ++i) {
 		std::string name = argv[i];
 		if (one_file(name) < 0) ++flags.errors;
 	}
 
+
+	// debug - dump sections
+	if (flags.v) {
+		printf("Sections:\n");
+		for (const auto &s : global_sections) {
+			printf("% 3d %-16s %ld\n", s.id, s.name.c_str(), s.data.size());
+		}
+		printf("Symbols:\n");
+		for (const auto &s : global_symbols) {
+			char m = ' ';
+			if (s.section == 0) m = '?';
+			else if (s.section == -1) m = '#'; // abs
+			printf("% 3d %c %-16s\n", s.id, m, s.name.c_str());
+		}
+	}
+
 	// if there are any missing symbols, search library files...
+
+	// merge the 
+
 
 	// merge sections into omf segments...
 	// (and build the stack segment...)
