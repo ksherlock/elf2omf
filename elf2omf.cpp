@@ -75,21 +75,8 @@ struct reloc {
 	unsigned offset = 0;
 	unsigned value = 0;
 
-	// negative indicates this is a section.
 	int symbol = 0;
 	unsigned type = 0;
-
-/*
-	unsigned src_section = 0;
-	unsigned src_offset = 0;
-	unsigned dest_section = 0;
-	unsigned dest_offset = 0;
-
-	unsigned symbol = 0;
-
-	unsigned type = 0;
-	unsigned addend = 0;
-*/
 };
 
 
@@ -107,6 +94,19 @@ struct symbol {
 	bool absolute = false;
 };
 
+enum {
+	TYPE_CODE = 1,
+	TYPE_DATA,
+	TYPE_CDATA,
+	TYPE_BSS
+};
+
+enum {
+	REGION_DP = 1,
+	REGION_NEAR,
+	REGION_FAR,
+	REGION_HUGE,
+};
 
 // this is our *merged* section, not an elf section
 struct section {
@@ -117,7 +117,9 @@ struct section {
 	uint32_t size = 0;
 	uint32_t align = 0;
 
-	// flag for bss-only?
+	unsigned type = 0;
+	unsigned region = 0;
+
 	std::vector<uint8_t> data;
 	std::vector<reloc> relocs;
 };
@@ -140,14 +142,49 @@ void throw_elf_error() {
 	throw std::runtime_error("invalid elf file");
 }
 
-bool is_dp(const std::string &name) {
-	if (name.empty()) return false;
-	char c = name.front();
-	if (c == 'r' && name == "registers") return true;
-	if (c == 'z' && name == "ztiny") return true;
-	if (c == 't' && name == "tiny") return true;
-	return false;
+unsigned name_to_region(const std::string &name) {
+	static std::unordered_map<std::string, unsigned> map = {
+		{"registers", REGION_DP},
+		{"tiny", REGION_DP},
+		{"ztiny", REGION_DP},
+		{"stack", REGION_DP},
+
+		{"data", REGION_NEAR},
+		{"cdata", REGION_NEAR},
+		{"zdata", REGION_NEAR},
+
+		{"near", REGION_NEAR},
+		{"cnear", REGION_NEAR},
+		{"znear", REGION_NEAR},
+
+		{"far", REGION_FAR},
+		{"cfar", REGION_FAR},
+		{"zfar", REGION_FAR},
+
+		{"huge", REGION_FAR},
+		{"chuge", REGION_FAR},
+		{"zhuge", REGION_FAR},
+	};
+
+
+	auto iter = map.find(name);
+	return (iter == map.end()) ? 0 : iter->second; 
 }
+
+unsigned type_to_type(unsigned sh_type, unsigned sh_flags) {
+	if (sh_type == SHT_NOBITS) return TYPE_BSS;
+
+	if (sh_type == SHT_PROGBITS) {
+		if (sh_flags & SHF_EXECINSTR) return TYPE_CODE;
+		if (sh_flags & SHF_WRITE) return TYPE_DATA;
+		return TYPE_CDATA;
+	}
+	// should not happen...
+	return 0;
+}
+
+typedef std::unordered_map<std::string, unsigned> symbol_map;
+typedef std::unordered_map<std::string, unsigned> section_map;
 
 /* find or create a symbol */
 symbol &find_symbol(const std::string &name) {
@@ -163,6 +200,13 @@ symbol &find_symbol(const std::string &name) {
 	return global_symbols[iter->second - 1];
 }
 
+symbol *maybe_find_symbol(const std::string &name) {
+	auto iter = global_symbol_map.find(name);
+	return (iter == global_symbol_map.end()) ? nullptr : &global_symbols[iter->second - 1];
+}
+
+
+#if 0
 symbol &find_symbol(const std::string &name, bool anonymous) {
 
 	auto iter = global_symbol_map.find(name);
@@ -175,8 +219,8 @@ symbol &find_symbol(const std::string &name, bool anonymous) {
 		return sym;
 	}
 	return global_symbols[iter->second - 1];
-
 }
+#endif
 
 // lookup/create a symbol table first in the local table, then in the global table.
 symbol &find_symbol(const std::string &name, std::unordered_map<std::string, int> &local_symbol_map, bool create_locally = false) {
@@ -200,7 +244,6 @@ symbol &find_symbol(const std::string &name, std::unordered_map<std::string, int
 section &find_section(const std::string &name) {
 
 	/* special case for known dp segments! */
-	if (is_dp(name)) return global_sections[0];
 
 	auto iter = global_section_map.find(name);
 	if (iter == global_section_map.end()) {
@@ -208,10 +251,19 @@ section &find_section(const std::string &name) {
 		s.name = name;
 		s.id = global_sections.size();
 
+
+		s.region = name_to_region(name);
+
 		global_section_map.emplace(name, s.id);
 		return s;
 	}
 	return global_sections[iter->second - 1];
+}
+
+section *maybe_find_section(const std::string &name) {
+	auto iter = global_section_map.find(name);
+	if (iter == global_section_map.end()) return nullptr;
+	return &global_sections[iter->second - 1];
 }
 
 bool must_swap(const Elf32_Ehdr &header) {
@@ -406,7 +458,6 @@ void simplify_abs_relocs() {
 }
 #endif
 
-// dp symbol simplification must be done *after* merge so offsets are correct.
 void simplify_relocations() {
 	// 1. reify SHN_ABS
 	// 2. reify dp references, if possible.
@@ -423,7 +474,229 @@ void simplify_relocations() {
 				return true;
 			}
 
+#if 0
 			if (sym.section == 1) {
+				if (r.type == 1 || r.type == 8 || r.type == 11) {
+					abs_reloc(s, r.offset, r.value + sym.offset, r.type);
+					return true;
+				}
+			}
+#endif
+			return false;
+		});
+		s.relocs.erase(it, s.relocs.end());
+	}
+}
+
+// .section attributes:
+// rodata -> SHT_PROGBITS, SHF_ALLOC
+// text   -> SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR
+// data   -> SHT_PROGBITS, SHF_ALLOC | SHF_WRITE
+// bss    -> SHT_NOBITS,   SHF_ALLOC | SHF_WRITE
+
+
+// linker generated symbols:
+// _O\x03.sectionStart_[name]
+// _O\x03.sectionEnd_[name]
+// _O\x03.sectionSize_[name] (32-bit absolute)
+// _DirectPageStart
+ 
+/*
+ * standard segments
+ * dp:
+ *   registers, tiny, ztiny
+ * code:
+ *   code, compactcode,farcode,
+ * data:
+ *   data, cdata (ro) zdata (bss)
+ *   near, cnear (ro), znear (bss)
+ *   far , cfar (ro), zfar (bss)
+ *   huge, chuge, (ro) zhuge (bss)
+ *
+ * calypsi linker-generated:
+ *   itiny, idata, inear, ifar, ihuge, data_init_table
+ * other:
+ *   reset, stack, heap
+ *
+ */
+
+
+
+// if there is a stack segment, it will be adjusted later
+void generate_linker_symbols(void) {
+	// .sectionStart, .sectionEnd, .sectionSize.
+	for (auto &s : global_sections) {
+
+		std::string name;
+		symbol *sym;
+
+		name = "_O\x03.sectionStart_" + s.name;
+		if ((sym = maybe_find_symbol(name))) {
+			sym->section = s.id;
+			sym->offset = 0;
+		}
+
+		name = "_O\x03.sectionEnd_" + s.name;
+		if ((sym = maybe_find_symbol(name))) {
+			sym->section = s.id;
+			sym->offset = s.data.size() - 1;
+		}
+
+		name = "_O\x03.sectionSize_" + s.name;
+		if ((sym = maybe_find_symbol(name))) {
+			sym->section = -1;
+			sym->offset = s.data.size();
+			sym->absolute = true;
+		}
+	}
+}
+
+
+// combine all the dp/stack segments into 1.
+
+void merge_dp_stack() {
+
+	struct map_entry {
+		unsigned section = 0;
+		unsigned offset = 0;
+		bool remap = false;
+	};
+
+
+	section &stack = global_sections.emplace_back();
+	stack.id = global_sections.size();
+	stack.name = "dp/stack";
+	stack.region = REGION_DP;
+
+	std::vector<map_entry> map(global_sections.size() + 1);
+
+	unsigned offset = 0;
+	unsigned align = 0;
+
+	std::string names[] = { "registers", "tiny", "ztiny" };
+	for (const auto &name : names) {
+		auto s = maybe_find_section(name);
+		if (!s) continue;
+
+		align = std::max(align, s->align);
+		if (align > 1) {
+			offset += (align - 1);
+			offset &= ~(align - 1);
+			stack.data.resize(offset);
+		}
+
+		map[s->id].section = stack.id;
+		map[s->id].offset = offset;
+		map[s->id].remap = true;
+		s->id = 0;
+
+		stack.data.insert(stack.data.end(), s->data.begin(), s->data.end());
+
+		std::vector<reloc> rr = std::move(s->relocs);
+		for (auto &r : rr) {
+			r.offset += offset;
+		}
+
+		stack.relocs.insert(stack.relocs.end(), rr.begin(), rr.end());
+		offset = stack.data.size();
+		s->relocs.clear();
+		s->data.clear();
+	}
+	if (stack.data.size() > 0xff) warnx("dp exceeds 255");
+
+	int sz = 0;
+
+	// stack segment?
+	auto s = maybe_find_section("stack");
+	if (s) {
+		if (s->type != TYPE_BSS) {
+			warnx("stack segment not bss");
+		}
+		sz = s->data.size();
+		sz = (sz + 0xff) & ~0xff;
+
+		map[s->id].section = stack.id;
+		map[s->id].offset = offset;
+		map[s->id].remap = true;
+		s->id = 0;
+		s->relocs.clear();
+		s->data.clear();
+
+	} else {
+		sz = flags.stack;
+
+		if (!sz && stack.data.empty()) {
+			global_sections.pop_back();
+			return;
+		}
+	}
+
+
+	int stack_offset = stack.data.size();
+	int stack_size = sz - stack.data.size();
+
+	if (stack_size < 0) {
+		warnx("stack segment too small");
+		stack_size = 0;
+	}
+	else {
+		stack.data.resize(sz);
+	}
+
+	// update the stack symbols...
+	symbol *sym;
+	if ((sym = maybe_find_symbol("_O\x03.sectionStart_stack"))) {
+		sym->section = stack.id;
+		sym->offset = stack_offset;
+	}
+	if ((sym = maybe_find_symbol("_O\x03.sectionStart_end"))) {
+		sym->section = stack.id;
+		sym->offset = stack_offset + stack_size - 1;
+	}
+	if ((sym = maybe_find_symbol("_O\x03.sectionStart_size"))) {
+		sym->section = -1;
+		sym->offset = stack_size;
+		sym->absolute = true;
+	}
+
+	if ((sym = maybe_find_symbol("_DirectPageStart"))) {
+		if (sym->section == 0) {
+			sym->section = stack.id;
+			sym->offset = 0;
+		}
+	}
+
+	// remap all the relocations.
+	for (auto &s : global_sections) {
+		if (&s == &stack) continue; // already handled
+		if (s.id < 1) continue;
+
+#if 0
+		for (auto &r : s.relocs) {
+			if (!r.symbol) continue;
+			auto &sym = global_symbols[r.symbol];
+			if (sym.absolute) continue;
+			const auto &m = map[sym.section];
+			if (!m.remap) continue;
+			sym.section = m.section;
+			sym.offset += m.offset;
+		}
+#endif
+
+		// update symbol references and try to simplify dp relocations.
+		// (since we know the bottom 8 bits now)
+		auto iter = std::remove_if(s.relocs.begin(), s.relocs.end(), [&](auto &r){
+
+			if (!r.symbol) return false; // ?
+			auto sym = global_symbols[r.symbol - 1];
+			if (sym.absolute) return false;
+			const auto &m = map[sym.section];
+			if (!m.remap) return false;
+
+			sym.section = m.section;
+			sym.offset += m.offset;
+
+			if (sym.section == stack.id) {
 				if (r.type == 1 || r.type == 8 || r.type == 11) {
 					abs_reloc(s, r.offset, r.value + sym.offset, r.type);
 					return true;
@@ -431,50 +704,65 @@ void simplify_relocations() {
 			}
 			return false;
 		});
-		s.relocs.erase(it, s.relocs.end());
+		s.relocs.erase(iter, s.relocs.end());
 	}
 }
 
-#if 0
 void to_omf(void) {
 
 
 	std::vector<omf::segment> segments;
-	omf::segment dp_segment;
-
-
-	// map the old section to the new segment.
-	struct map {
-		unsigned section = 0;
-		unsigned offset = 0;
-		unsigned align;
-	};
-
-
-	std::vector<map> local_section_map(global_sections.size());
 
 	for (auto &s : global_sections) {
-		if (is_dp(s.name)) {
 
-			auto &m = local_section_map[s.id];
-			m.section = -1;
-			m.offset = dp_segment.size();
-			m.align = std::max(m.align, s.align);
+		if (s.id < 1) continue;
 
-			auto &data = dp_segment.data();
-			if (data.empty()) {
-				data = std::move(s.data);
-			} else {
+		auto &seg = segments.emplace_back();
+		seg.segnum = segments.size();
+		seg.segname = std::move(s.name);
+		if (s.type == TYPE_CODE) {
+			seg.kind = 0x0000; // static, code
+		} else {
+			seg.kind = 0x0001; // static data
+			if (s.region == REGION_DP)
+				seg.kind = 0x0012; // dp 
+		}
 
-			}
+		// $01-$100 = page align
+		// > $100 = bank aligned
+		// dp/stack segment auto page-aligned.
+		if (s.align > 1) seg.alignment = 0x0100;
+
+		if (s.type == TYPE_BSS && s.relocs.empty()) {
+			seg.reserved_space = s.data.size();
 			continue;
+		}
+		seg.data = std::move(s.data);
+
+		for (const auto &r : s.relocs) {
+
+			const auto &sym = global_symbols[r.symbol - 1];
+			if (sym.section == s.id) {
+				omf::reloc rr;
+				rr.size = type_to_size[r.type];
+				rr.shift = type_to_shift[r.type];
+				rr.offset = r.offset;
+				rr.value = r.value + sym.offset;
+				seg.relocs.push_back(rr);
+			} else {
+				omf::interseg is;
+				is.size = type_to_size[r.type];
+				is.shift = type_to_shift[r.type];
+				is.offset = r.offset;
+				is.segment = sym.section;
+				is.segment_offset = r.value + sym.offset;
+				seg.intersegs.push_back(is);
+			}
 		}
 	}
 
-
-
+	save_omf(flags.o, segments, flags.omf_flags);
 }
-#endif
 
 
 int one_file(const std::string &filename) {
@@ -559,8 +847,14 @@ int one_file(const std::string &filename) {
 
 
 			section &gs = find_section(name);
+			unsigned t = type_to_type(s.sh_type, s.sh_flags);
+			if (gs.type == 0) {
+				gs.type = t;
+			} else if (gs.type != t) {
+				warnx("%s:%s - type mismatch", filename.c_str(), name.c_str());
+				gs.type = -1;
+			}
 
-			// todo flags, etc.
 
 			if (gs.align < s.sh_addralign) {
 				gs.align = s.sh_addralign;
@@ -761,11 +1055,21 @@ int one_file(const std::string &filename) {
 
 void init(void) {
 
+#if 0
 	// create dp/stack segment for 
 	// this does not go in the name map.
-	auto &s = global_sections.emplace_back();
-	s.name = "dp/stack";
-	s.id = 1;
+	{
+		auto &s = global_sections.emplace_back();
+		s.name = "dp/stack";
+		s.id = 1;
+	}
+
+	{
+		auto &sym = find_symbol("_DirectPageStart");
+		sym.section = 1;
+	}
+	// todo -- "_NearBaseAddress" --> near data bank. 
+#endif
 }
 
 bool parse_ft(const std::string &s) {
@@ -818,7 +1122,7 @@ int main(int argc, char **argv) {
 	int ch;
 	std::string outfile;
 
-	while ((ch = getopt(argc, argv, "o:vh")) != -1) {
+	while ((ch = getopt(argc, argv, "ht:o:v1CSX")) != -1) {
 		switch (ch) {
 			case 'o': flags.o = optarg; break;
 			case 'v': flags.v = true; break;
@@ -877,7 +1181,10 @@ int main(int argc, char **argv) {
 
 	// if there are any missing symbols, search library files...
 
-	// merge the 
+	generate_linker_symbols();
+	merge_dp_stack();
+	simplify_relocations();
+	to_omf();
 
 
 	// merge sections into omf segments...
