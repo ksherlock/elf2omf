@@ -113,15 +113,26 @@ struct section {
 	std::string name;
 	int id = 0;
 
-	// uint8_t flags = 0;
-	uint32_t size = 0;
 	uint32_t align = 0;
 
 	unsigned type = 0;
 	unsigned region = 0;
 
+
+	unsigned bss_size = 0;
+
 	std::vector<uint8_t> data;
 	std::vector<reloc> relocs;
+	// std::vector<unsigned> symbols;
+
+	unsigned omf_segment = 0;
+	unsigned omf_offset = 0;
+
+
+	unsigned size() const {
+		return type == TYPE_BSS ? bss_size : data.size();
+	}
+
 };
 
 std::unordered_map<std::string, int> global_section_map;
@@ -361,15 +372,14 @@ int load_elf_type(int fd, const Elf32_Ehdr &header, const Elf32_Shdr& section, s
 static unsigned type_to_size[16] = { 0, 1, 2, 3, 4, 8, 0, 0, 1, 2, 2, 1, 2, 3, 2, 2 };
 static unsigned type_to_shift[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 16, 0, 16 };
 
-/* do an absolute relocation. */
-int abs_reloc(section &section, uint32_t offset, uint32_t value, unsigned type) {
+int abs_reloc(std::vector<uint8_t> &data, uint32_t offset, uint32_t value, unsigned type) {
 
 	if (type > 15) return -1;
 	unsigned size = type_to_size[type];
 	unsigned shift = type_to_shift[type];
 
-	if (offset >= section.data.size()) return -1;
-	if (offset + size > section.data.size()) return -1;
+	if (offset >= data.size()) return -1;
+	if (offset + size > data.size()) return -1;
 
 	switch (type) {
 	case 0:
@@ -395,10 +405,16 @@ int abs_reloc(section &section, uint32_t offset, uint32_t value, unsigned type) 
 
 	if (shift) value <<= shift;
 	for (unsigned i = 0; i < size; ++i, ++offset, value >>= 8) {
-		section.data[offset] = value & 0xff;
+		data[offset] = value & 0xff;
 	}
 
 	return 0;
+}
+
+/* do an absolute relocation. */
+int abs_reloc(section &section, uint32_t offset, uint32_t value, unsigned type) {
+
+	return abs_reloc(section.data, offset, value, type);
 }
 
 #if 0
@@ -552,6 +568,478 @@ void generate_linker_symbols(void) {
 }
 
 
+template<class T>
+void move_or_append(std::vector<T> &out, std::vector<T> &in) {
+
+	if (out.empty()) {
+		out = std::move(in);
+	} else {
+		out.insert(out.end(), in.begin(), in.end());
+	}
+}
+
+
+template<class T>
+void append(std::vector<T> &out, const std::vector<T> &in) {
+
+	out.insert(out.end(), in.begin(), in.end());
+}
+
+typedef std::vector<std::reference_wrapper<section>> section_ref_vector ;
+
+// counts up region sizes.
+unsigned analyze(const section_ref_vector &sections, unsigned data[5][7]) {
+
+	unsigned total = 0;
+	for (const section &s : sections) {
+
+		unsigned sz = data[s.region][s.type];
+		unsigned x = s.size();
+
+		unsigned mask = 0;
+		if (s.align > 1) {
+			mask = s.align - 1;
+			sz = (sz + mask) & ~mask;
+			total = (total + mask) & ~mask;
+		}
+
+		data[s.region][s.type] = sz + x;
+		total += x;
+
+		// total this region excl code [?]
+		if (s.type != TYPE_CODE) {
+			sz = data[s.region][5];
+			if (mask) sz = (sz + mask) & ~mask;
+			data[s.region][5] = sz + x;
+		}
+
+		// total this region
+		sz = data[s.region][6];
+		if (mask) sz = (sz + mask) & ~mask;
+		data[s.region][6] = sz + x;
+	}
+	return total;
+}
+
+
+void to_omf(void) {
+
+
+	section *stack = nullptr;
+	// make sure there's a stack segment if needed.
+	{
+		auto s = maybe_find_section("stack");
+		if (s) {
+			stack = s;
+			if (s->type != TYPE_BSS) errx(1, "stack section not bss");
+			if (flags.stack && flags.stack != s->size()) {
+				warnx("-S ignored");
+			}
+		} else if (flags.stack) {
+			auto &s = find_section("stack");
+			s.type = TYPE_BSS;
+			s.bss_size = flags.stack;
+			stack = &s;
+		}
+	}
+
+
+	section_ref_vector sections;
+	section_ref_vector dp_sections;
+
+	sections.reserve(global_sections.size());
+	dp_sections.reserve(4);
+
+	for (auto &s : global_sections) {
+		if (s.type == TYPE_BSS) continue;
+
+		if (s.region == REGION_DP) {
+			dp_sections.push_back(std::ref(s));
+		} else {
+			sections.push_back(std::ref(s));
+		}
+	}
+	// bss last
+	for (auto &s : global_sections) {
+		if (s.type != TYPE_BSS) continue;
+
+		if (s.region == REGION_DP) {
+			if (&s == stack) continue; // special handling... 
+			dp_sections.push_back(std::ref(s));
+		} else {
+			sections.push_back(std::ref(s));
+		}
+	}
+
+	// sort the dp sections - registers, tiny, ztiny, stack
+	// n.b. - aside from stack, these are alphabetical. so just compare the first letter.
+	std::sort(dp_sections.begin(), dp_sections.end(), [](const section &a, const section &b){
+		unsigned ca = a.name.front();
+		unsigned cb = b.name.front();
+		if (ca == 's') ca = 'z'+1;
+		if (cb == 's') cb = 'z'+1;
+		return ca < cb;
+	});
+
+
+	unsigned sizes[5][7] = {};
+
+	unsigned total = analyze(sections, sizes);
+	analyze(dp_sections, sizes);
+	// best case -- 1 segment!
+
+	// link types
+	// 1. everything goes in 1 segment
+	// 2. all near segments merged
+	// 3. all near data merged, separate near code
+	// 4. 
+
+
+	std::vector<omf::segment> segments;
+	unsigned segnum = 1;
+	if (total < 0x010000) {
+		auto &seg = segments.emplace_back();
+		seg.segnum = segnum++;
+
+
+		unsigned offset = 0;
+		bool need_align = false;
+		for (section &s : sections) {
+
+			unsigned mask = 0;
+			unsigned sz = s.size();
+			if (s.align > 1) {
+				need_align = true;
+				mask = s.align - 1;
+			}
+
+
+
+			if (s.type == TYPE_BSS) {
+
+				if (mask) {
+					unsigned orig = offset;
+					offset = (offset + mask) & ~mask;
+					seg.reserved_space += (offset - orig);
+				}
+				seg.reserved_space += sz;
+			} else {
+
+				if (mask) {
+					offset = (offset + mask) & ~mask;
+					seg.data.resize(offset);
+				}
+
+				append(seg.data, s.data);
+			}
+
+			s.omf_segment = seg.segnum;
+			s.omf_offset = offset;
+			offset += sz;
+		}
+		// omf only has page or bank alignment.
+		if (need_align) seg.alignment = 0x0100;
+
+
+		//
+		symbol *sym;
+		if ((sym = maybe_find_symbol("_NearBaseAddress"))) {
+			const section &s = sections.front(); 
+			sym->section = s.id;
+			sym->offset = 0;
+		}
+
+	} else {
+		errx(1, "not yet...");
+	}
+
+	// now handle the dp segment.
+	unsigned dp_size = analyze(dp_sections, sizes);
+
+	if (dp_size > 0 || stack) {
+
+		if (dp_size > 0x8000) {
+			// gs/os books says 48k max but 32k ought to be sufficient.
+			errx(1, "dp too large ($%04x)", dp_size);
+		}
+		if (dp_size > 0 && !stack) {
+			errx(1, "stack section missing.  Use -S size or create a bss stack section.");
+		}
+
+		int stack_size = stack ? stack->size() - dp_size : 0;
+
+		if (stack && stack_size <= 0)
+			errx(1, "stack too small ($%04x)", stack_size);
+
+		auto &seg = segments.emplace_back();
+		seg.segnum = segnum++;
+		seg.kind = 0x12; // dp/stack
+		seg.alignment = 0x0100; // redundant
+		seg.segname = "dp/stack";
+
+		if (stack) {
+			stack->align = 0; // no alignment
+			stack->bss_size = stack_size;
+			dp_sections.emplace_back(std::ref(*stack));
+
+			symbol *sym;
+			// update symbols (only size and end shoud be changing)
+
+			if ((sym = maybe_find_symbol("_O\x03.sectionStart_stack"))) {
+				sym->section = stack->id;
+				sym->offset = 0;
+			}
+			if ((sym = maybe_find_symbol("_O\x03.sectionStart_end"))) {
+				sym->section = stack->id;
+				sym->offset = stack_size - 1;
+			}
+			if ((sym = maybe_find_symbol("_O\x03.sectionStart_size"))) {
+				sym->section = -1;
+				sym->offset = stack_size;
+				sym->absolute = true;
+			}
+		}
+
+		if (!dp_sections.empty()) {
+			symbol *sym;
+			section &s = dp_sections.front();
+			if ((sym = maybe_find_symbol("_DirectPageStart"))) {
+				sym->section = s.id;
+				sym->offset = 0;
+			}
+		}
+
+
+		unsigned offset = 0;
+		for (section &s : dp_sections) {
+
+			unsigned mask = 0;
+			unsigned sz = s.size();
+			if (s.align > 1) {
+				mask = s.align - 1;
+			}
+
+			if (s.type == TYPE_BSS) {
+
+				if (mask) {
+					unsigned orig = offset;
+					offset = (offset + mask) & ~mask;
+					seg.reserved_space += (offset - orig);
+				}
+				seg.reserved_space += sz;
+			} else {
+
+				if (mask) {
+					offset = (offset + mask) & ~mask;
+					seg.data.resize(offset);
+				}
+				append(seg.data, s.data);
+			}
+
+			s.omf_segment = seg.segnum;
+			s.omf_offset = offset;
+			offset += sz;
+		}
+
+	}
+
+	// ok, now we can convert dp relocations into absolute values.
+	// ... and convert relocations to omf relocations.
+
+
+	append(sections, dp_sections);
+
+	for (const section &s : sections) {
+
+		auto &seg = segments[s.omf_segment - 1];
+
+		for (const auto &r : s.relocs) {
+
+			const auto &sym = global_symbols[r.symbol - 1];
+
+			unsigned offset = r.offset + s.omf_offset;
+			unsigned value = r.value + sym.offset;
+
+			if (sym.absolute) {
+				abs_reloc(seg.data, offset, value, r.type);
+				continue;
+			}
+
+			if (!r.symbol) errx(1, "relocation missing symbol");
+
+			const auto &src = global_sections[sym.section - 1];
+
+			value += src.omf_offset;
+
+			// convert dp reference to a constant.
+			if (r.type == 1 || r.type == 8 || r.type == 11) {
+				abs_reloc(seg.data, offset, value, r.type);
+				continue;
+			}
+
+			unsigned size = type_to_size[r.type];
+			unsigned shift = type_to_shift[r.type];
+
+			if (src.omf_segment == s.omf_segment) {
+				omf::reloc rr;
+				rr.size = size;
+				rr.shift = shift;
+				rr.offset = offset;
+				rr.value = value;
+				seg.relocs.push_back(rr);
+			} else {
+				omf::interseg is;
+				is.size = size;
+				is.shift = shift;
+				is.offset = offset;
+				is.segment = src.omf_segment;
+				is.segment_offset = value;
+				seg.intersegs.push_back(is);
+			}
+
+		}
+
+	}
+
+
+	save_omf(flags.o, segments, flags.omf_flags);
+}
+
+#if 0
+void assign_omf_segments(void) {
+
+	// for stack/dp, registers, data, bss
+	// for everything else, as-is (should i move bss to the end?)
+
+	// 1. if everything fits in 1 bank, merge into 1 segment
+	unsigned everything = 0;
+
+	// indexed by region and type.  entry 5 is total for the region. entry 6 is total (excl code)
+	unsigned sizes[5][7] = { };
+
+	for (const auto &s : global_sections) {
+		unsigned size = s.data.size();
+
+		if (s.region == REGION_DP) continue;
+		if (s.align > 1) {
+			unsigned mask = (s.align - 1);
+			everything = (everything + mask) & ~mask;
+			sizes[s.region][5] = (sizes[s.region][5] + mask) & ~mask;
+			if (s.type != TYPE_CODE) {
+				sizes[s.region][6] = (sizes[s.region][6] + mask) & ~mask;
+			}
+		}
+		sizes[s.region][s.type] += size;
+		sizes[s.region][5] += size;
+		if (s.type != TYPE_CODE) {
+			sizes[s.region][6] += size;
+		}
+
+		everything += size;
+	}
+
+	int sz;
+	sz = sizes[REGION_DP][5]; // total
+	if (sz > 0x010000)
+		errx(1, "stack/dp overflow (%$04x)", sz);
+
+	sz = sizes[REGION_NEAR][TYPE_CODE];
+	if (sz > 0x010000)
+		errx(1, "near code overflow (%$04x)", sz);
+
+	sz = sizes[REGION_NEAR][6]; // total (excl code)
+	if (sz > 0x010000)
+		errx(1, "near data overflow (%$04x)", sz);
+
+	// todo -- check that individual far data sections are < 0x010000;
+	// todo -- check that individual far/huge code sections are < 0x010000;
+
+	unsigned segnum = 1;
+
+	if (everything < 0x010000) {
+		unsigned offset = 0;
+		for (auto &s : global_sections) {
+			if (s.region == REGION_DP) continue;
+			// if (s.type == TYPE_BSS) continue;
+
+			if (s.align > 1) {
+				unsigned mask = (s.align - 1);
+				offset = (offset + mask) & ~mask;
+			}
+			s.omf_segment = 1;
+			s.omf_offset = offset;
+		}
+		segnum++;
+		// can add _NearDataBank symbol as welll.
+	} else {
+		// near data sections *must* be merged.  if possible, merge w/ near code as well.
+
+		// todo
+		if (sizes[REGION_NEAR][5] < 0x010000) {
+
+		}
+
+		for (auto &s : global_sections) {
+
+		}
+
+	}
+
+
+	// now handle merge the dp/stack segment.
+	if (sizes[REGION_DP][5] || flags.stack) {
+		// should we re-order?
+		unsigned offset;
+		std::string names[] = { "registers", "tiny", "ztiny" };
+		for (const auto &name : names) {
+			auto s = maybe_find_section(name);
+			if (!s) continue;
+
+			if (s->align > 1) {
+				unsigned mask = s->align - 1;
+				offset = (offset + mask) & ~mask;
+			}
+			s->omf_segment = segnum;
+			s->omf_offset = offset;
+			offset += s->data.size();
+		}
+		auto s = maybe_find_section("stack");
+		unsigned stack_size = 0;
+		if (s) {
+			// hmm... should we verify no symbols pointing to the stack?
+			if (s->type != TYPE_BSS) warnx("stack not bss");
+			stack_size = s->data.size();
+			stack_size = (stack_size + 0xff);
+		} else {
+			stack_size = flags.stack ? flags.stack : 4096;
+		}
+		if (stack_size < offset) {
+			warnx("stack too small");
+		}
+		else {
+
+		}
+
+		if (s) {
+			s->omf_segment = segnum;
+			s->omf_offset = offset;
+			s->data.resize(stack_size - offset);
+		} else {
+			section &s = global_sections.emplace_back();
+			s.id = global_sections.size();
+			s.type = TYPE_BSS;
+			s.region = REGION_DP;
+			s.name = "stack/dp";
+			s.omf_segment = segnum;
+			s.omf_offset = offset;
+			s->data.resize(stack_size - offset);
+		}
+
+		++segnum;
+	}
+
+
+}
 // combine all the dp/stack segments into 1.
 
 void merge_dp_stack() {
@@ -561,6 +1049,76 @@ void merge_dp_stack() {
 		unsigned offset = 0;
 		bool remap = false;
 	};
+
+
+
+
+	// 1. check if everything can be merged into one segment...
+	unsigned size = 0;
+	// unsigned align = 4;
+	for (const auto &s : global_sections) {
+		if (s.region == REGION_DP) continue;
+		size += s.data.size();
+		size = (size + 3) & ~3;
+	}
+
+	// yes!
+	if (size <= 0x010000) {
+
+		section ss;
+
+		// 2 passes so bss is moved to the end.
+		unsigned bss = 0;
+		unsigned align = 0;
+
+		for (auto &s : global_sections) {
+			if (s.region == REGION_DP) continue;
+			if (s.type == TYPE_BSS) {
+				bss += s.data.size();
+				continue;
+			}
+
+			unsigned offset = ss.data.size();
+			align = std::max(ss.align, s.align);
+			if (align > 1) {
+				offset = (offset + (align - 1)) & (align - 1);
+				ss.data.resize(offset);
+			}
+			map[s.id].section = ss.section;
+			map[s.id].offset = ss.data.size();
+
+			for (auto &r : s.relocs) {
+				r.offset += offset;
+			}
+
+			move_or_append(ss.data, s.data);
+			move_or_append(s.relocs);
+			s.relocs.clear();
+			s.data.clear();
+		}
+
+		//second pass for bss
+		unsigned offset = ss.data.size();
+		for (auto &s : global_sections) {
+			if (s.region == REGION_DP) continue;
+			if (s.type != TYPE_BSS) continue;
+
+			int sz = s.data.size();
+
+
+
+		}
+
+
+	}
+
+
+
+
+
+
+
+
 
 
 	section &stack = global_sections.emplace_back();
@@ -763,7 +1321,7 @@ void to_omf(void) {
 
 	save_omf(flags.o, segments, flags.omf_flags);
 }
-
+#endif
 
 int one_file(const std::string &filename) {
 	// process one elf file.
@@ -837,44 +1395,61 @@ int one_file(const std::string &filename) {
 				continue;
 			}
 
-			if (s.sh_type != SHT_PROGBITS && s.sh_type != SHT_NOBITS) continue;
-
-			// if (s.sh_name == 0) continue;
-
 			std::string name;
 			if (s.sh_name && s.sh_name < string_table.size())
 				name = (char *)string_table.data() + s.sh_name;
 
 
-			section &gs = find_section(name);
-			unsigned t = type_to_type(s.sh_type, s.sh_flags);
-			if (gs.type == 0) {
-				gs.type = t;
-			} else if (gs.type != t) {
-				warnx("%s:%s - type mismatch", filename.c_str(), name.c_str());
-				gs.type = -1;
+			if (s.sh_type == SHT_NOBITS) {
+
+
+				section &gs = find_section(name);
+				if (gs.type == 0) gs.type = TYPE_BSS;
+
+
+				if (gs.type != TYPE_BSS)
+					errx(1, "%s: %s - section type mismatch", filename.c_str(), name.c_str());
+
+
+				gs.align = std::max(gs.align, s.sh_addralign);
+				if (gs.align > 1) {
+					unsigned mask = gs.align - 1;
+					gs.bss_size = (gs.bss_size + mask) & ~mask;
+				}				
+
+				local_section_map[sh_num].section = gs.id;
+				local_section_map[sh_num].offset = gs.bss_size;
+
+				gs.bss_size += s.sh_size;
+				continue;
 			}
-
-
-			if (gs.align < s.sh_addralign) {
-				gs.align = s.sh_addralign;
-			}
-
-			auto &data = gs.data;
-			if (gs.align > 1) {
-				unsigned mask = (gs.align - 1);
-				if (data.size() & mask)
-					data.resize((data.size() + mask) & ~mask);
-			}
-
-			local_section_map[sh_num].section = gs.id;
-			local_section_map[sh_num].offset = data.size();
 
 			if (s.sh_type == SHT_PROGBITS) {
+
+				section &gs = find_section(name);
+				unsigned t = type_to_type(s.sh_type, s.sh_flags);
+				if (gs.type == 0) {
+					gs.type = t;
+				}
+				if (gs.type != t) {
+					errx(1, "%s:%s - section type mismatch", filename.c_str(), name.c_str());
+				}
+
+				auto &data = gs.data;
+				gs.align = std::max(gs.align, s.sh_addralign);
+
+				if (gs.align > 1) {
+					unsigned mask = (gs.align - 1);
+					if (data.size() & mask)
+						data.resize((data.size() + mask) & ~mask);
+				}
+
+				local_section_map[sh_num].section = gs.id;
+				local_section_map[sh_num].offset = data.size();
+
 				load_elf_data(fd, header, s, data);
-			} else {
-				data.resize(data.size() + s.sh_size);
 			}
+
 		}
 
 
@@ -903,10 +1478,8 @@ int one_file(const std::string &filename) {
 
 
 			// todo -- the .calypsi_info section can make some undefined references
-			// a .require-ment.
+			// a .require-ment. (also noreorder, others?)
 
-
-			// todo -- another function find_symbol(name, bool create_anonymously)?
 
 			symbol &sym = find_symbol(name, local_symbol_map, bind == STB_LOCAL);
 
@@ -917,6 +1490,12 @@ int one_file(const std::string &filename) {
 
 			if (x.st_shndx == 0) continue;
 
+#if 0
+			if (x.st_shndx != SHN_UNDEF && x.st_shndx != SHN_ABS) {
+				auto &s = global_sections[local_sections [x.st_shndx] - 1];
+				s.symbols.push_back(sym.id);
+			}
+#endif
 
 			if (sym.section == 0) {
 				// new symbol!  let's define it
@@ -1018,28 +1597,6 @@ int one_file(const std::string &filename) {
 				rr.value = r.r_addend;
 				rr.symbol = sym.id;
 				gs.relocs.push_back(rr);
-
-#if 0
-				if (sym.st_shndx == SHN_ABS) {
-					// this is a constant number (should never happen) so relocate now....
-					abs_reloc(gs, rr.offset, sym.st_value, rtype);
-					continue;
-				}
-
-				std::string name = (char *)string_table.data() + sym.st_name;
-
-				// todo -- SHN_COMMON?
-
-				if (sym.st_shndx == SHN_UNDEF ) {
-					auto &gs = find_symbol(name); // possibly generate a new symbol table entry.
-					rr.symbol = gs.id;
-				} else {
-					// local symbol could be private so bypass symbol table stuff.
-					rr.symbol = -local_section_map[sym.st_shndx].section; 
-					rr.value += local_section_map[sym.st_shndx].offset + sym.st_value;
-				}
-				gs.relocs.push_back(rr);
-#endif
 			}
 
 		}
@@ -1054,6 +1611,9 @@ int one_file(const std::string &filename) {
 }
 
 void init(void) {
+
+// idea... create empty placeholder register, tiny, ztiny, stack segments
+// so they're in the order I want them?
 
 #if 0
 	// create dp/stack segment for 
@@ -1098,6 +1658,22 @@ bool parse_ft(const std::string &s) {
 	return true;
 }
 
+bool parse_stack(const std::string &s) {
+	if (s.empty()) return false;
+
+	int rv = 0;
+	size_t end = 0;
+	try {
+		rv = std::stoi(s, &end, 10);
+	} catch (std::exception &ex) {
+		return false;
+	}
+	if (rv < 0) return false;
+	if (end != s.length()) return false;
+	flags.stack = rv;
+	return true;
+}
+
 void usage(int ec = EX_USAGE) {
 	fputs("usage elf2omf [flags] file...\n"
 		"Flags:\n"
@@ -1105,7 +1681,7 @@ void usage(int ec = EX_USAGE) {
 			" -v               be verbose\n"
 			" -X               inhibit ExpressLoad segment\n"
 			" -C               inhibit SUPER records\n"
-			" -S size          specify stack segment size (default 4096)\n"
+			" -S size          specify stack segment size\n"
 			" -1               generate version 1 OMF File\n"
 			" -o file          specify outfile name\n"
 //			" -l library       specify library\n"
@@ -1122,14 +1698,13 @@ int main(int argc, char **argv) {
 	int ch;
 	std::string outfile;
 
-	while ((ch = getopt(argc, argv, "ht:o:v1CSX")) != -1) {
+	while ((ch = getopt(argc, argv, "ht:o:v1CS:X")) != -1) {
 		switch (ch) {
 			case 'o': flags.o = optarg; break;
 			case 'v': flags.v = true; break;
 
 			case '1': flags.omf_flags |= OMF_V1; break;
 			case 'C': flags.omf_flags |= OMF_NO_SUPER; break;
-			case 'S': flags.S = true; break;
 			case 'X': flags.omf_flags |= OMF_NO_EXPRESS; break;
 
 			case 'h': usage(0);
@@ -1138,6 +1713,13 @@ int main(int argc, char **argv) {
 				// -t xx[:xxxx] -- set file/auxtype.
 				if (!parse_ft(optarg)) {
 					errx(EX_USAGE, "Invalid -t argument: %s", optarg);
+				}
+				break;
+			}
+
+			case 'S': {
+				if (!parse_stack(optarg)) {
+					errx(EX_USAGE, "Invalid -S argument: %s", optarg);
 				}
 				break;
 			}
@@ -1182,8 +1764,8 @@ int main(int argc, char **argv) {
 	// if there are any missing symbols, search library files...
 
 	generate_linker_symbols();
-	merge_dp_stack();
-	simplify_relocations();
+	// merge_dp_stack();
+	// simplify_relocations();
 	to_omf();
 
 
