@@ -5,6 +5,7 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -403,7 +404,7 @@ int abs_reloc(std::vector<uint8_t> &data, uint32_t offset, uint32_t value, unsig
 		break;
 	}
 
-	if (shift) value <<= shift;
+	if (shift) value >>= shift;
 	for (unsigned i = 0; i < size; ++i, ++offset, value >>= 8) {
 		data[offset] = value & 0xff;
 	}
@@ -565,6 +566,31 @@ void generate_linker_symbols(void) {
 			sym->absolute = true;
 		}
 	}
+}
+
+
+bool check_for_missing_symbols(bool pass1 = true) {
+
+	// linker-generated symbols.
+	static std::unordered_set<std::string> skippable = {
+		"_DirectPageStart", "_NearBaseAddress",
+		"_0\x03.sectionStart_stack",
+		"_0\x03.sectionEnd_stack",
+		"_0\x03.sectionSize_stack",
+	};
+
+	bool ok = true;
+	for (auto &sym : global_symbols) {
+
+		if (!sym.count) continue;
+		if (sym.absolute) continue;
+		if (sym.section == 0) {
+			if (pass1 && skippable.count(sym.name)) continue;
+			warnx("undefined symbol: %s", sym.name.c_str());
+			ok = false;
+		}
+	}
+	return ok;
 }
 
 
@@ -878,7 +904,7 @@ void to_omf(void) {
 			}
 
 			unsigned size = type_to_size[r.type];
-			unsigned shift = type_to_shift[r.type];
+			unsigned shift = -type_to_shift[r.type];
 
 			if (src.omf_segment == s.omf_segment) {
 				omf::reloc rr;
@@ -1764,8 +1790,7 @@ int main(int argc, char **argv) {
 	// if there are any missing symbols, search library files...
 
 	generate_linker_symbols();
-	// merge_dp_stack();
-	// simplify_relocations();
+	if (!check_for_missing_symbols()) exit(1);
 	to_omf();
 
 
