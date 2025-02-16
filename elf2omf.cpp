@@ -519,9 +519,9 @@ bool check_for_missing_symbols(bool pass1 = true) {
 	// linker-generated symbols.
 	static std::unordered_set<std::string> skippable = {
 		"_DirectPageStart", "_NearBaseAddress",
-		"_0\x03.sectionStart_stack",
-		"_0\x03.sectionEnd_stack",
-		"_0\x03.sectionSize_stack",
+		"_O\x03.sectionStart_stack",
+		"_O\x03.sectionEnd_stack",
+		"_O\x03.sectionSize_stack",
 	};
 
 	bool ok = true;
@@ -603,6 +603,8 @@ void to_omf(void) {
 		if (s) {
 			stack = s;
 			if (s->type != TYPE_BSS) errx(1, "stack section not bss");
+			s->bss_size = (s->bss_size + 0xff) & ~0xff;
+			s->align = 0;
 			if (flags.stack && flags.stack != s->size()) {
 				warnx("-S ignored");
 			}
@@ -727,18 +729,24 @@ void to_omf(void) {
 	// now handle the dp segment.
 	unsigned dp_size = analyze(dp_sections, sizes);
 
+	// could also check if we need an explicit direct page --
+	// via symbols (.sectionStart stack, _DirectPageStart)
+
 	if (dp_size > 0 || stack) {
 
-		if (dp_size > 0x8000) {
-			// gs/os books says 48k max but 32k ought to be sufficient.
-			errx(1, "dp too large ($%04x)", dp_size);
+		if (dp_size > 0xff) {
+			errx(1, "dp exceeds 1 page ($%04x)", dp_size);
 		}
+
 		if (dp_size > 0 && !stack) {
 			errx(1, "stack section missing.  Use -S size or create a bss stack section.");
 		}
 
-		int stack_size = stack ? stack->size() - dp_size : 0;
+		if (stack && stack->size() > 0x8000) {
+			errx(1, "stack too big ($%04x)", stack->size());
+		}
 
+		int stack_size = stack ? stack->size() - dp_size : 0;
 		if (stack && stack_size <= 0)
 			errx(1, "stack too small ($%04x)", stack_size);
 
@@ -760,11 +768,11 @@ void to_omf(void) {
 				sym->section = stack->id;
 				sym->offset = 0;
 			}
-			if ((sym = maybe_find_symbol("_O\x03.sectionStart_end"))) {
+			if ((sym = maybe_find_symbol("_O\x03.sectionEnd_stack"))) {
 				sym->section = stack->id;
 				sym->offset = stack_size - 1;
 			}
-			if ((sym = maybe_find_symbol("_O\x03.sectionStart_size"))) {
+			if ((sym = maybe_find_symbol("_O\x03.sectionSize_stack"))) {
 				sym->section = -1;
 				sym->offset = stack_size;
 				sym->absolute = true;
@@ -1223,6 +1231,8 @@ bool parse_stack(const std::string &s) {
 		return false;
 	}
 	if (rv < 0) return false;
+	rv = (rv + 0xff) & ~0xff;
+	if (rv > 0x8000) return false; // in theory 48k
 	if (end != s.length()) return false;
 	flags.stack = rv;
 	return true;
