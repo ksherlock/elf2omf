@@ -2,8 +2,6 @@ name: Make
 
 on: [push]
 
-env:
-
 jobs:
   build:
     runs-on: ${{ matrix.os }}
