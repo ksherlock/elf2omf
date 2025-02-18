@@ -754,7 +754,6 @@ void to_omf(void) {
 		auto &seg = segments.emplace_back();
 		seg.segnum = segnum++;
 		seg.kind = 0x12; // dp/stack
-		seg.alignment = 0x0100; // redundant
 		seg.segname = "dp/stack";
 
 		if (stack) {
